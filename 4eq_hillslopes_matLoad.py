@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 
 # Folders
-data_dir = '/home/orchidee04/afendric/RESULTS/CE_DYNAM'
+data_dir = '/home/surface3/afendric/RESULTS/CE_DYNAM'
 
 # Loads packages
 from osgeo import gdal
-import math, os, glob, sys, numpy as np, scipy.sparse.linalg, scipy.optimize, datetime, pandas as pd, patsy, pickle
+import math, os, glob, sys, numpy as np, scipy.sparse.linalg, scipy.optimize, datetime, pandas as pd, patsy, cPickle as pickle, subprocess
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -19,10 +19,9 @@ len_poo = len(soil_pools)
 set_eros = sys.argv[1] # Erosion ('y') or no erosion ('n')
 set_depo = sys.argv[2] # Deposition ('y') or no deposition ('n')
 
-year_min = int(sys.argv[3])
-year_max = 2019
-
-years = range(year_min, year_max)
+years = range(1860, 2019)
+if(len(sys.argv) == 4):
+	years = range(int(sys.argv[3]), 2019)
 months = range(12)
 mdays = np.array([31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31])
 
@@ -51,23 +50,31 @@ hsfr = gdal.Open(data_dir + '/input/others/Hillslope_fraction.tif')
 grid = gdal.Open(data_dir + '/input/others/Grid_area.tif')
 flac = gdal.Open(data_dir + '/input/others/Flow_accumulation.tif')
 bulk = gdal.Open(data_dir + '/input/others/Bulk_density.tif')
+soc = gdal.Open(data_dir + '/input/others/Carbon_content.tif')
 dpth = gdal.Open(data_dir + '/input/others/Soil_depth.tif')
 
-def ratio_calc(yr):
+def gzip_open(fname):
+	# This is just a faster version of:
+	# import pickle, gzip; a = pickle.load(gzip.open(fname, 'rb'))
+
+	lnk = subprocess.Popen(["zcat", fname], stdout = subprocess.PIPE)
+	stdo = lnk.communicate()
+	out = pickle.loads(stdo[0])
+	return out
+
+def ratio_calc(yr_old, yr_new):
 	# There is a small error on the emulator. It does not scale stocks on 01/Jan as ORCHIDEE does.
 	# Since this is the only error, we can solve it by simply deriving such ratio from the carbon stocks, as below.
 	# We also load the land cover because this calculation is only triggered when land cover changes.
 	ratio = 1. + np.zeros((nc * nr * len_pft * len_soi * len_poo), dtype = 'float32')
 
 	mo_new = 0
-	yr_new = yr + 1
 	va_new = gdal.Open(data_dir + '/input/ORCHIDEE/carbon/carbon_active_' + str(yr_new) + '.tif')
 	vs_new = gdal.Open(data_dir + '/input/ORCHIDEE/carbon/carbon_slow_' + str(yr_new) + '.tif')
 	vp_new = gdal.Open(data_dir + '/input/ORCHIDEE/carbon/carbon_passive_' + str(yr_new) + '.tif')
 	lc_new = gdal.Open(data_dir + '/input/landcover/landcover_' + str(yr_new) + '.tif')
 
 	mo_old = 11
-	yr_old = yr
 	va_old = gdal.Open(data_dir + '/input/ORCHIDEE/carbon/carbon_active_' + str(yr_old) + '.tif')
 	vs_old = gdal.Open(data_dir + '/input/ORCHIDEE/carbon/carbon_slow_' + str(yr_old) + '.tif')
 	vp_old = gdal.Open(data_dir + '/input/ORCHIDEE/carbon/carbon_passive_' + str(yr_old) + '.tif')
@@ -81,32 +88,41 @@ def ratio_calc(yr):
 		for i in range(1, nr + 1):
 			ncell = (i-1)*nc + k
 
-			dlc_new = lc_new.ReadAsArray(0, i-1, nc, 1)
-			dlc_old = lc_old.ReadAsArray(0, i-1, nc, 1)
+			dlc_new = lc_new.ReadAsArray(0, i-1, nc, 1).astype('float64')
+			dlc_old = lc_old.ReadAsArray(0, i-1, nc, 1).astype('float64')
 			delta_veg = dlc_new[j] - dlc_old[j]
 			mds = np.where(delta_veg > 0)[1] # The change is triggered only when the share increases
 
 			dlc_new[dlc_new == lc_new.GetRasterBand(1).GetNoDataValue()] = np.nan
-			dva_new = va_new.ReadAsArray(0, i-1, nc, 1)
+			dva_new = va_new.ReadAsArray(0, i-1, nc, 1).astype('float64')
 			dva_new[dva_new == va_new.GetRasterBand(1).GetNoDataValue()] = np.nan
-			dvs_new = vs_new.ReadAsArray(0, i-1, nc, 1)
+			dvs_new = vs_new.ReadAsArray(0, i-1, nc, 1).astype('float64')
 			dvs_new[dvs_new == vs_new.GetRasterBand(1).GetNoDataValue()] = np.nan
-			dvp_new = vp_new.ReadAsArray(0, i-1, nc, 1)
+			dvp_new = vp_new.ReadAsArray(0, i-1, nc, 1).astype('float64')
 			dvp_new[dvp_new == vp_new.GetRasterBand(1).GetNoDataValue()] = np.nan
 			dva_new = dva_new[idx_lyr_new, 0, :]
 			dvs_new = dvs_new[idx_lyr_new, 0, :]
 			dvp_new = dvp_new[idx_lyr_new, 0, :]
 
 			dlc_old[dlc_old == lc_old.GetRasterBand(1).GetNoDataValue()] = np.nan
-			dva_old = va_old.ReadAsArray(0, i-1, nc, 1)
+			dva_old = va_old.ReadAsArray(0, i-1, nc, 1).astype('float64')
 			dva_old[dva_old == va_old.GetRasterBand(1).GetNoDataValue()] = np.nan
-			dvs_old = vs_old.ReadAsArray(0, i-1, nc, 1)
+			dvs_old = vs_old.ReadAsArray(0, i-1, nc, 1).astype('float64')
 			dvs_old[dvs_old == vs_old.GetRasterBand(1).GetNoDataValue()] = np.nan
-			dvp_old = vp_old.ReadAsArray(0, i-1, nc, 1)
+			dvp_old = vp_old.ReadAsArray(0, i-1, nc, 1).astype('float64')
 			dvp_old[dvp_old == vp_old.GetRasterBand(1).GetNoDataValue()] = np.nan
+
 			dva_old = dva_old[idx_lyr_old, 0, :]
 			dvs_old = dvs_old[idx_lyr_old, 0, :]
 			dvp_old = dvp_old[idx_lyr_old, 0, :]
+
+			# Trick: I had to do this to avoid division by very small numbers
+			dva_new[dva_new < 1e-3] = 0.
+			dvs_new[dvs_new < 1e-3] = 0.
+			dvp_new[dvp_new < 1e-3] = 0.
+			dva_old[dva_old < 1e-3] = 0.
+			dvs_old[dvs_old < 1e-3] = 0.
+			dvp_old[dvp_old < 1e-3] = 0.
 
 			t_hs = hsfr.ReadAsArray(0, i-1, nc, 1).astype('float64')
 			t_hs[t_hs == hsfr.GetRasterBand(1).GetNoDataValue()] = np.nan
@@ -136,21 +152,65 @@ def gen_mats(v, yr, mo):
 #		# We have to load the data for the whole year
 
 ###
-		p_a = np.exp(v[20])
-		p_b = np.real(- np.exp(p_a) - 1. * scipy.special.lambertw(- np.exp(p_a - np.exp(p_a))))
-
 		x = np.zeros((nc * nr * len_pft * len_soi * len_poo), dtype = 'float32')
 		va = gdal.Open(data_dir + '/input/ORCHIDEE/carbon/carbon_active_1860.tif')
 		vs = gdal.Open(data_dir + '/input/ORCHIDEE/carbon/carbon_slow_1860.tif')
 		vp = gdal.Open(data_dir + '/input/ORCHIDEE/carbon/carbon_passive_1860.tif')
 
-		k = np.arange(nc)
-		for j in range(len_pft):
-			idx_lyr = mo * len_pft + j
+		for i in range(1, nr + 1):
+			# First, calculates the vertical discretization of SOC
+			t_dp = dpth.ReadAsArray(0, i-1, nc, 1).astype('float64') # Reads the soil depth in cm
+			t_dp[t_dp == dpth.GetRasterBand(1).GetNoDataValue()] = np.nan
+			t_dp = t_dp * 1./100 # Converts from cm to m
+			dz_all = np.zeros((len_soi, nc))
+			zmax = np.zeros((len_soi, nc))
+			zmin = np.zeros((len_soi, nc))
+			p_a = np.exp(v[20])
+			p_b = np.real(- np.exp(p_a) - 1. * scipy.special.lambertw(- np.exp(p_a - np.exp(p_a)))) # We calculate for d = 1, only to get the proportions in %
+			for k in range(nc):
+				if np.isnan(t_dp[0, k]): continue
+				for z in soil_layers:
+					dz_all[z, k] = t_dp[0, k] * 1/p_b * (np.exp(p_a + p_b * (z+1)/len_soi) - np.exp(p_a + p_b * z/len_soi))
+				dz_all[:, k] = np.flip(dz_all[:, k]) # We flip because we calculate an exponential increase above, but we want an exponential decrease
+				zmax[:, k] = dz_all[:, k].cumsum()
+				zmin[1:, k] = zmax[0:(len_soi-1), k]
 
-			for i in range(1, nr + 1):
+			dep_max = np.array([0.05, 0.15, 0.30, 0.60, 1., 2.]) # in meters, taken from SoilGrids (the source of bulk density)
+			dep_min = np.r_[0, dep_max[0:-1]]
+			t_b = bulk.ReadAsArray(0, i-1, nc, 1).astype('float64') * 0.01 # Multiplies by 0.01 because the data is in 100*g/cm3 originally
+			t_b[t_b == bulk.GetRasterBand(1).GetNoDataValue()] = np.nan
+			t_b[t_b < 0.] = 0.
+			t_c = soc.ReadAsArray(0, i-1, nc, 1).astype('float64') # Units are dg/kg, so we should multiply it by (t_b * grid_area * height).
+			# ... However, since grid_area is constant and we only need percentages, I multiply by t_b here and height after. The unit of the final quantity is a ratio MASS/AREA.
+			t_c[t_c == soc.GetRasterBand(1).GetNoDataValue()] = np.nan
+			t_c[t_b < 0.] = 0.
+			t_c = t_c * t_b
+			b_al = np.zeros((len_soi, t_b.shape[1], t_b.shape[2]))
+			c_al = np.zeros((len_soi, t_b.shape[1], t_b.shape[2]))
+			for k in range(nc):
+				for z in soil_layers:
+					lmax = np.min(np.where(dep_max >= round(zmax[z, k], 2))) # Finds the corresponding layers, the rounding is just to solve numerical issues
+					lmin = np.max(np.where(dep_min <= round(zmin[z, k], 2)))
+
+					# Creates a vector with min and max depths to interpolate the dataset
+					d_min = dep_min[range(lmin, lmax + 1)]
+					d_min[0] = zmin[z, k]
+					d_max = dep_max[range(lmin, lmax + 1)]
+					d_max[-1] = zmax[z, k]
+					for j in range(lmax - lmin + 1):
+						b_al[z, 0, k] = b_al[z, 0, k] + (d_max[j] - d_min[j]) * t_b[lmin + j, 0, k]
+						c_al[z, 0, k] = c_al[z, 0, k] + (d_max[j] - d_min[j]) * t_c[lmin + j, 0, k]
+					b_al[z, 0, k] = b_al[z, 0, k]/(zmax[z, k] - zmin[z, k]) # For b_al we need the absolute values...
+				c_al[:, 0, k] = c_al[:, 0, k]/np.sum(c_al[:, 0, k]) # ... but for c_al we need the percentages
+			t_b = None
+			t_c = None
+
+			# Then, values at equilibrium
+			for j in range(len_pft):
+				idx_lyr = mo * len_pft + j
+
+				k = np.arange(nc)
 				ncell = (i-1)*nc + k
-
 				dva = va.ReadAsArray(0, i-1, nc, 1)
 				dva[dva == va.GetRasterBand(1).GetNoDataValue()] = np.nan
 				dvs = vs.ReadAsArray(0, i-1, nc, 1)
@@ -167,27 +227,26 @@ def gen_mats(v, yr, mo):
 				for z in range(len_soi):
 					idx = ncell*len_soi*len_pft*len_poo + z*len_pft*len_poo + j*len_poo
 
-					x[idx + 0] = (dva * t_hs) * 1/p_b * (np.exp(p_a + p_b * (z+1)/len_soi) - np.exp(p_a + p_b * z/len_soi))
-					x[idx + 1] = (dvs * t_hs) * 1/p_b * (np.exp(p_a + p_b * (z+1)/len_soi) - np.exp(p_a + p_b * z/len_soi))
-					x[idx + 2] = (dvp * t_hs) * 1/p_b * (np.exp(p_a + p_b * (z+1)/len_soi) - np.exp(p_a + p_b * z/len_soi))
+					x[idx + 0] = (dva * t_hs) * c_al[z, 0, :]
+					x[idx + 1] = (dvs * t_hs) * c_al[z, 0, :]
+					x[idx + 2] = (dvp * t_hs) * c_al[z, 0, :]
 		x[np.isnan(x)] = 0.
 ###
 		if set_eros == 'y' and set_depo == 'y':
 			print 'Starting the iterative procedure: - Time: ' + str(datetime.datetime.now())
 			it = 1
-			while it <= 5: # Iteration criteria
+			while it <= 6: # Iteration criteria
 				it += 1
 				for yk in range(1860, 1870):
 					x_old = 1. * x
 					for mk in months:
 						name = out_dir + out_dir_app + 'HS-' + str(yk) +'-%02d' % (mk + 1) + '-'
-						A_exp = pickle.load(open(name + 'A_cut.npz', 'rb'))
+						A_exp = gzip_open(name + 'A_cut.npz')
 						A_cut = A_exp[0].tocsr() + A_exp[1].tocsr() + A_exp[2].tocsr()
 
-						B_cut = pickle.load(open(name + 'B_cut.npz', 'rb'))
-						fi = pickle.load(open(name + 'fi.npz', 'rb'))
+						B_cut = gzip_open(name + 'B_cut.npz')
+						fi = gzip_open(name + 'fi.npz')
 
-						x_old = 1. * x
 						x_cut = 1. * x[fi]
 						dif = mdays[mk]
 						x_cut = x_cut + dif * (B_cut - A_cut.dot(x_cut))
@@ -195,33 +254,42 @@ def gen_mats(v, yr, mo):
 						x[fi] = 1. * x_cut
 
 						if mk == 11:
-							ratio = ratio_calc(yk)
+							yr_old = yk
+
+							if(yk < 1869): yr_new = yk + 1
+							else: yr_new = 1860
+
+							ratio = ratio_calc(yr_old, yr_new)
 							x = x * ratio
 
 					p = np.nansum(abs(x - x_old)/abs(x_old) < 1e-2)/float(np.sum(x > 0)) # Convergence criteria
 					print 'p = ' + str(round(p, 4))
+					print 'max(x) = ' + str(np.nanmax(x))
+					# print 'which.max(x) = ' + str(np.where(x == np.nanmax(x))[0])
+					print 'problem point = ' + str(x[12626177])
 					sys.stdout.flush()
 			x[np.isnan(x)] = 0.
 			print 'Ending the iterative procedure: - Time: ' + str(datetime.datetime.now())
 ###
 		# Then, we load for mo = 0 only and return
 		name = out_dir + out_dir_app + 'HS-' + str(yr) + '-%02d' % (mo + 1) + '-'
-		A_exp = pickle.load(open(name + 'A_cut.npz', 'rb'))
+		A_exp = gzip_open(name + 'A_cut.npz')
 		A_cut = A_exp[0].tocsr() + A_exp[1].tocsr() + A_exp[2].tocsr()
-		B_cut = pickle.load(open(name + 'B_cut.npz', 'rb'))
-		fi = pickle.load(open(name + 'fi.npz', 'rb'))
+
+		B_cut = gzip_open(name + 'B_cut.npz')
+		fi = gzip_open(name + 'fi.npz')
 
 		return fi, A_cut, B_cut, x
 
 	name = out_dir + out_dir_app + 'HS-' + str(yr) + '-%02d' % (mo + 1) + '-'
-	A_exp = pickle.load(open(name + 'A_cut.npz', 'rb'))
+	A_exp = gzip_open(name + 'A_cut.npz')
 	A_cut = A_exp[0].tocsr() + A_exp[1].tocsr() + A_exp[2].tocsr()
-	B_cut = pickle.load(open(name + 'B_cut.npz', 'rb'))
-	fi = pickle.load(open(name + 'fi.npz', 'rb'))
+	B_cut = gzip_open(name + 'B_cut.npz')
+	fi = gzip_open(name + 'fi.npz')
 	if(mo < 11):
 		return fi, A_cut, B_cut
 	elif(mo == 11):
-		ratio = ratio_calc(yr)
+		ratio = ratio_calc(yr, yr+1)
 		return fi, A_cut, B_cut, ratio
 
 

@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 
 # Folders
-data_dir = '/home/orchidee04/afendric/RESULTS/CE_DYNAM' 
+data_dir = '/home/surface3/afendric/RESULTS/CE_DYNAM' 
 
 # Loads packages
 from osgeo import gdal
-import math, os, glob, sys, numpy as np, scipy.sparse.linalg, scipy.optimize, datetime, pandas as pd, patsy, pickle
+import math, os, glob, sys, numpy as np, scipy.sparse.linalg, scipy.optimize, datetime, pandas as pd, patsy, cPickle as pickle, gzip
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -50,10 +50,11 @@ slop = gdal.Open(data_dir + '/input/others/Slope.tif')
 hsfr = gdal.Open(data_dir + '/input/others/Hillslope_fraction.tif')
 grid = gdal.Open(data_dir + '/input/others/Grid_area.tif')
 flac = gdal.Open(data_dir + '/input/others/Flow_accumulation.tif')
+soc = gdal.Open(data_dir + '/input/others/Carbon_content.tif')
 bulk = gdal.Open(data_dir + '/input/others/Bulk_density.tif')
 dpth = gdal.Open(data_dir + '/input/others/Soil_depth.tif')
 #
-bass = gdal.Open('/home/users/afendric/CE_DYNAM/3sediment_calibration/input/basins-binary.tif')
+# bass = gdal.Open('/home/users/afendric/CE_DYNAM/3sediment_calibration/input/basins-binary.tif')
 #
 
 # We have to generate the basis matrix for slope and flow accumulation
@@ -123,8 +124,8 @@ def gen_AB(i, v, yr, mo):
 	m = mask.ReadAsArray(0, i-1, nc, 1).astype('float32')
 	m[m != 1.] = np.nan
 #
-	mb = bass.ReadAsArray(0, i-1, nc, 1).astype('float16')
-	mb[mb != 1.] = np.nan
+#	mb = bass.ReadAsArray(0, i-1, nc, 1).astype('float16')
+#	mb[mb != 1.] = np.nan
 #
 
 	## Reads the share of hillslopes, the grid area, and the PFT map
@@ -196,27 +197,39 @@ def gen_AB(i, v, yr, mo):
 	t_kD = np.zeros((len_soi, len_pft, 1, nc)) ## The daily turnover rate
 	t_kD_HS = np.zeros((len_soi, len_pft, 1, nc)) ## The analogous, for hillslopes
 
+	# Calculates the vertical discretization of bulk density and SOC, which will be useful later
+	dep_max = np.array([0.05, 0.15, 0.30, 0.60, 1., 2.]) # in meters, taken from SoilGrids (the source of bulk density)
+	dep_min = np.r_[0, dep_max[0:-1]]
+	t_b = bulk.ReadAsArray(0, i-1, nc, 1).astype('float64') * 0.01 # Multiplies by 0.01 because the data is in 100*g/cm3 originally
+	t_b[t_b == bulk.GetRasterBand(1).GetNoDataValue()] = np.nan
+	t_b[t_b < 0.] = 0.
+	t_c = soc.ReadAsArray(0, i-1, nc, 1).astype('float64') # Units are dg/kg, so we should multiply it by (t_b * grid_area * height).
+	# ... However, since grid_area is constant and we only need percentages, I multiply by t_b here and height after. The unit of the final quantity is a ratio MASS/AREA.
+	t_c[t_c == soc.GetRasterBand(1).GetNoDataValue()] = np.nan
+	t_c[t_b < 0.] = 0.
+	t_c = t_c * t_b
+
+	b_al = np.zeros((len_soi, t_b.shape[1], t_b.shape[2]))
+	c_al = np.zeros((len_soi, t_b.shape[1], t_b.shape[2]))
+	for k in range(nc):
+		for z in soil_layers:
+			lmax = np.min(np.where(dep_max >= round(zmax[z, k], 2))) # Finds the corresponding layers, the rounding is just to solve numerical issues
+			lmin = np.max(np.where(dep_min <= round(zmin[z, k], 2)))
+
+			# Creates a vector with min and max depths to interpolate the dataset
+			d_min = dep_min[range(lmin, lmax + 1)]
+			d_min[0] = zmin[z, k]
+			d_max = dep_max[range(lmin, lmax + 1)]
+			d_max[-1] = zmax[z, k]
+			for j in range(lmax - lmin + 1):
+				b_al[z, 0, k] = b_al[z, 0, k] + (d_max[j] - d_min[j]) * t_b[lmin + j, 0, k]
+				c_al[z, 0, k] = c_al[z, 0, k] + (d_max[j] - d_min[j]) * t_c[lmin + j, 0, k]
+			b_al[z, 0, k] = b_al[z, 0, k]/(zmax[z, k] - zmin[z, k]) # For b_al we need the absolute values...
+		c_al[:, 0, k] = c_al[:, 0, k]/np.sum(c_al[:, 0, k]) # ... but for c_al we need the percentages
+	t_b = None
+	t_c = None
+
 	if(set_eros == 'y' and set_depo == 'y'):
-		dep_max = np.array([0.05, 0.15, 0.30, 0.60, 1., 2.]) # in meters, taken from SoilGrids (the source of bulk density)
-		dep_min = np.r_[0, dep_max[0:-1]]
-		t_b = bulk.ReadAsArray(0, i-1, nc, 1).astype('float64') * 0.01 # Multiplies by 0.01 because the data is in 100*g/cm3 originally
-		t_b[t_b < 0.] = 0.
-		b_al = np.zeros((len_soi, t_b.shape[1], t_b.shape[2]))
-		for k in range(nc):
-			for z in soil_layers:
-				lmax = np.min(np.where(dep_max >= round(zmax[z, k], 2))) # Finds the corresponding layers, the rounding is just to solve numerical issues
-				lmin = np.max(np.where(dep_min <= round(zmin[z, k], 2)))
-
-				# Creates a vector with min and max depths to interpolate the dataset
-				d_min = dep_min[range(lmin, lmax + 1)]
-				d_min[0] = zmin[z, k]
-				d_max = dep_max[range(lmin, lmax + 1)]
-				d_max[-1] = zmax[z, k]
-				for j in range(lmax - lmin + 1):
-					b_al[z, 0, k] = b_al[z, 0, k] + (d_max[j] - d_min[j]) * t_b[lmin + j, 0, k]
-				b_al[z, 0, k] = b_al[z, 0, k]/(zmax[z, k] - zmin[z, k])
-		t_b = None
-
 		## Calculates the gross and net erosion from hillslopes
 		t_e = eros.ReadAsArray(0, i-1, nc, 1).astype('float64') # Reads the erosion rates in t/(ha.month)
 		t_e[t_e < 0.] = 0.
@@ -327,10 +340,10 @@ def gen_AB(i, v, yr, mo):
 		k_lit_soi['littera'][p] = (klitma_soila + klitsa_soila + klitmb_soila + klitsb_soila) * (1. - t_hs) # in g/(m2.day)
 		k_lit_soi['litters'][p] = (klitsa_soils + klitsb_soils) * (1. - t_hs) # in g/(m2.day)
 
-#		### ... and vertically discretizes them
+#		### ... and vertically discretizes them proportionally to the observed SOC
 		for k in ['littera', 'litters']:
 			for z in soil_layers:
-				k_lit_soi[k + '_vd'][z, p, 0, :] = k_lit_soi[k][p] * 1/p_b * (np.exp(p_a + p_b * (z+1)/len_soi) - np.exp(p_a + p_b * z/len_soi))
+				k_lit_soi[k + '_vd'][z, p, 0, :] = k_lit_soi[k][p] * c_al[z, 0, :]
 	k_lit_soi[k + '_vd'][np.isnan(k_lit_soi[k + '_vd']) | np.isinf(k_lit_soi[k + '_vd']) | np.isneginf(k_lit_soi[k + '_vd'])] = 0.
 
 	# Then, calculates the fluxes between pools (a -> s, s -> p etc.). These are assumed identical for all soil layers
@@ -543,8 +556,8 @@ def gen_AB(i, v, yr, mo):
 
 	for z in soil_layers:
 		for k in range(nc):
-#			if np.isnan(m[0, k]): continue
-			if np.isnan(mb[0, k]): continue
+			if np.isnan(m[0, k]): continue
+#			if np.isnan(mb[0, k]): continue
 
 			# We have to update index_x at every cell
 			# And again, we don't have to look all neighbors if we are on the borders
@@ -1016,7 +1029,7 @@ def gen_mats(v, yr, mo):
 #	B_cut = B[fi]
 
 	name = out_dir + out_dir_app + 'FL-' + str(yr) + '-%02d' % (mo + 1) + '-' # I add +1 to mo just to avoid confusions with the file name
-	fi = pickle.load(open(name + 'fi.npz', 'rb'))
+	fi = pickle.load(gzip.open(name + 'fi.npz', 'rb'))
 	B_cut = B[fi]
 
 #	A_exp = list()
@@ -1025,12 +1038,12 @@ def gen_mats(v, yr, mo):
 #	A_exp.append(A_lateralOut)
 #	A_exp.append(A_verticalIn)
 #	A_exp.append(A_verticalOut)
-#	pickle.dump(A_exp, open(name + 'A_cut.npz', 'wb'))
-#	pickle.dump(fi, open(name + 'fi.npz', 'wb'))
+#	pickle.dump(A_exp, gzip.open(name + 'A_cut.npz', 'wb', compresslevel=6))
+#	pickle.dump(fi, gzip.open(name + 'fi.npz', 'wb', compresslevel=6))
 	B_exp = list()
 	B_exp.append(B_litter)
 	B_exp.append(B_hs)
-	pickle.dump(B_cut, open(name + 'B_cut.npz', 'wb'))
+	pickle.dump(B_cut, gzip.open(name + 'B_cut.npz', 'wb', compresslevel=6))
 
 	return 1
 
