@@ -5,7 +5,7 @@ data_dir = '/home/surface3/afendric/RESULTS/CE_DYNAM'
 
 # Loads packages
 from osgeo import gdal
-import math, os, glob, sys, numpy as np, scipy.sparse.linalg, scipy.optimize, datetime, pandas as pd, patsy, cPickle as pickle, gzip
+import math, os, glob, sys, numpy as np, scipy.sparse.linalg, scipy.optimize, datetime, pandas as pd, cPickle as pickle, gzip
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -15,15 +15,19 @@ warnings.filterwarnings('ignore')
 soil_pools = ['a', 's', 'p'] # Active, Slow and Passive pools
 len_poo = len(soil_pools)
 
+# Defines the effect of CC to reduce soil erosion (CCf) and enrichment factor (EFf)
+EFf = 1.00
+
 # Defines if we will run with or without erosion/deposition
 set_eros = sys.argv[1] # Erosion ('y') or no erosion ('n')
 set_depo = sys.argv[2] # Deposition ('y') or no deposition ('n')
 
 year_min = int(sys.argv[3])
 year_max = year_min + 1
-
 years = range(year_min, year_max)
-months = range(12)
+
+mo = int(sys.argv[4])
+months = range(mo, mo + 1)
 mdays = np.array([31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31])
 
 len_soi = 3 # The number of soil layersz
@@ -32,9 +36,9 @@ soil_layers = range(len_soi)
 # Then, changes the output path according to the decision
 out_dir = data_dir + '/output/Simulations/'
 if(set_eros == 'y' and set_depo == 'y'):
-	out_dir_app = 'Yeros-Ydepo/'
+	out_dir_app = 'Yeros-Ydepo_WithoutCCs_EF1/'
 elif(set_eros == 'n' and set_depo == 'n'):
-	out_dir_app = 'Neros-Ndepo/'
+	out_dir_app = 'Neros-Ndepo_WithoutCCs_EF1/'
 else:
 	sys.exit()
 
@@ -47,31 +51,15 @@ nr = pft.RasterYSize
 # Loads the study area mask, the hillslope fraction, and the slope
 mask = gdal.Open(data_dir + '/input/others/Mask.tif')
 slop = gdal.Open(data_dir + '/input/others/Slope.tif')
-hsfr = gdal.Open(data_dir + '/input/others/Hillslope_fraction.tif')
 grid = gdal.Open(data_dir + '/input/others/Grid_area.tif')
 flac = gdal.Open(data_dir + '/input/others/Flow_accumulation.tif')
 bulk = gdal.Open(data_dir + '/input/others/Bulk_density.tif')
 soc = gdal.Open(data_dir + '/input/others/Carbon_content.tif')
 dpth = gdal.Open(data_dir + '/input/others/Soil_depth.tif')
+sgra = gdal.Open(data_dir + '/input/others/ORC_SG-ratio.tif')
 #
 # bass = gdal.Open('/home/users/afendric/CE_DYNAM/3sediment_calibration/input/basins-binary.tif')
 #
-
-# We have to generate the basis matrix for slope and flow accumulation
-vals = slop.ReadAsArray().astype('float64')
-vals[vals == slop.GetRasterBand(1).GetNoDataValue()] = np.nan
-vals = np.log(np.concatenate(vals) + 0.1) # This log-scale is to deal with outliers
-vals = vals[~np.isnan(vals)]
-dsm_sl = patsy.dmatrix("bs(x, df=5, degree=3, include_intercept=True) - 1", {"x": vals})
-
-vals = flac.ReadAsArray().astype('float64')
-vals[vals == flac.GetRasterBand(1).GetNoDataValue()] = np.nan
-vals[(vals < 0.)] = np.nan
-vals = np.log(np.concatenate(vals)) # This log-scale is to deal with outliers
-vals = vals[~np.isnan(vals)]
-dsm_fl = patsy.dmatrix("bs(x, df=5, degree=3, include_intercept=True) - 1", {"x": vals})
-
-vals = None
 
 ## Function to iterate over the area for equilibrium and transient calculation
 def gen_AB(i, v, yr, mo):
@@ -99,6 +87,11 @@ def gen_AB(i, v, yr, mo):
 		yr_flux = yr
 		mo_flux = mo + 1
 
+	## For the years > 2018, we recycle the data of 2010-18
+	df = yr_stock - yr_flux
+	if yr_flux > 2018:
+		yr_flux = 2010 + ((yr_flux - 2019) % 9)
+		yr_stock = yr_flux + df
 
 	# First, load some datasets
 	pft = gdal.Open(data_dir + '/input/landcover/landcover_' + str(yr_flux) + '.tif')
@@ -107,9 +100,7 @@ def gen_AB(i, v, yr, mo):
 	clay = gdal.Open(data_dir + '/input/ORCHIDEE/Clay_fraction.tif')
 	grid = gdal.Open(data_dir + '/input/others/Grid_area.tif')
 
-	## Reads the share of hillslopes and the grid area
-	t_hs = hsfr.ReadAsArray(0, i-1, nc, 1).astype('float64')
-	t_hs[t_hs == hsfr.GetRasterBand(1).GetNoDataValue()] = np.nan
+	## Reads the grid area
 	t_g = grid.ReadAsArray(0, i-1, nc, 1).astype('float64')
 	t_g[t_g == grid.GetRasterBand(1).GetNoDataValue()] = np.nan
 
@@ -121,17 +112,17 @@ def gen_AB(i, v, yr, mo):
 	dz_all = np.zeros((len_soi, nc))
 	zmax = np.zeros((len_soi, nc))
 	zmin = np.zeros((len_soi, nc))
-	p_a = np.exp(v[20])
-	p_b = np.real(- np.exp(p_a) - 1. * scipy.special.lambertw(- np.exp(p_a - np.exp(p_a)))) # We calculate for d = 1, only to get the proportions in %
 	for k in range(nc):
 		if np.isnan(t_dp[0, k]): continue
-		for z in soil_layers:
-			dz_all[z, k] = t_dp[0, k] * 1/p_b * (np.exp(p_a + p_b * (z+1)/len_soi) - np.exp(p_a + p_b * z/len_soi))
-		dz_all[:, k] = np.flip(dz_all[:, k]) # We flip because we calculate an exponential increase above, but we want an exponential decrease
+		dz_all[0, k] = 0.30 # First layer is assumed to have 30cm, so we have the correct erosion rate affecting it
+		dz_all[1:, k] = np.repeat((t_dp[0, k] - 0.3) * 1./(len_soi - 1), (len_soi - 1))
 		zmax[:, k] = dz_all[:, k].cumsum()
 		zmin[1:, k] = zmax[0:(len_soi-1), k]
 
 	## Calculates the respiration rate in each soil pool
+	fx = sgra.ReadAsArray(0, i-1, nc, 1).astype('float64')
+	fx[fx == sgra.GetRasterBand(1).GetNoDataValue()] = np.nan
+
 	kresp = {}
 	for p in soil_pools:
 		if p == 'a':
@@ -162,8 +153,10 @@ def gen_AB(i, v, yr, mo):
 			
 			s = stock0[idx_stock, 0, :]
 			s[s == stock0_na] = np.nan
+			s[s < 1e-2] = 0.
 			
-			t = t/s # This is actually t = (t * t_g * t_hs * (vertical_discretization) * 1e-6)/(s * t_g * t_hs * (vertical_discretization) * 1e-6)
+			t = t/s # This is actually t = (t * t_g * (vertical_discretization) * 1e-6)/(s * t_g * (vertical_discretization) * 1e-6)
+			t = t * fx # We multiply by fx to get SoilGrid stocks
 			t[np.isinf(t) | np.isneginf(t) | np.isnan(t)] = 0.
 
 			kresp[var][j, 0, :] = t
@@ -181,7 +174,7 @@ def gen_AB(i, v, yr, mo):
 	t_b[t_b == bulk.GetRasterBand(1).GetNoDataValue()] = np.nan
 	t_b[t_b < 0.] = 0.
 	t_c = soc.ReadAsArray(0, i-1, nc, 1).astype('float64') # Units are dg/kg, so we should multiply it by (t_b * grid_area * height).
-	# ... However, since grid_area is constant and we only need percentages, I multiply by t_b here and height after. The unit of the final quantity is a ratio MASS/AREA.
+		## ... However, grid_area is constant and we only need percentages, so multiply by t_b here and height after. The unit of the final quantity is a ratio MASS/AREA.
 	t_c[t_c == soc.GetRasterBand(1).GetNoDataValue()] = np.nan
 	t_c[t_b < 0.] = 0.
 	t_c = t_c * t_b
@@ -215,49 +208,24 @@ def gen_AB(i, v, yr, mo):
 		for l in range(1, len_pft):
 			if(l == 0): continue
 			idxe = mo * len_pft + l
-			E_tot[l] = t_e[idxe] * t_g * 1e-4 # Conversion from m2 to ha, E_tot is in t/year
+			E_tot[l] = 1. * t_e[idxe]
+		E_sum = np.nansum(E_tot, axis = 0) # The total erosion, t/(ha.month)
 
-		t_s = slop.ReadAsArray(0, i-1, nc, 1).astype('float64')
-		t_pf = pft.ReadAsArray(0, i-1, nc, 1).astype('float64')
-		t_pf[t_pf == pft.GetRasterBand(1).GetNoDataValue()] = np.nan
-		t_pf = t_pf/100.
-
-		t_s[t_s < 0] = np.nan
-		t_s = np.log(0.1 + t_s) # This is just to improve scale
-		na = np.where(~np.isnan(t_s[0]))[0]
-		nd = {"x": t_s[~np.isnan(t_s)]}
-		f = np.zeros((len_pft, 1, nc))
-		f = f * t_s * 0.
-		if(len(nd['x']) > 0):
-			new_dsm_sl = patsy.build_design_matrices([dsm_sl.design_info], nd)[0]
-
-			# We assume four different curves for f: crop, grass, bare = 0, and forest
-			for l in range(1, len_pft):
-				if l == 0: continue # Bare
-				elif l in [1, 2, 3, 4, 5, 6, 7, 8]: # Forest
-					b = np.array([v[0], v[1], v[2], v[3], v[4]])
-				elif l in [9, 10, 13, 14]: # Grass
-					b = np.array([v[5], v[6], v[7], v[8], v[9]])
-				elif l in [11, 12]: # Croplands
-					b = np.array([v[10], v[11], v[12], v[13], v[14]])
-				f[l, 0, na] = np.dot(new_dsm_sl, b) * t_pf[l, 0, na]
-		f = np.sum(f, axis = 0)
-		f = 1./(1. + np.exp(f))
-
+		t_lc = pft.ReadAsArray(0, i-1, nc, 1).astype('float64')
+		t_lc[t_lc == pft.GetRasterBand(1).GetNoDataValue()] = np.nan
+		t_lc = t_lc/100.
 		for l in range(1, len_pft):
 			if(l == 0): continue
-
-			if(yr == 1860 and mo == 0):
-				kEE[l, 0, :] = E_tot[l]/np.sum(mdays)
-			else:
-				kEE[l, 0, :] = E_tot[l]/mdays[mo]
-			kE[l, 0, :] = f * kEE[l, 0, :]
+			kEE[l, 0, :] = EFf * E_tot[l] * (t_g * 1e-4)/mdays[mo] # Conversion to t/(day)
+			kE[l, 0, :] = 1.0 * kEE[l, 0, :]
+		kE[(np.isnan(kE)) | (np.isinf(kE)) | (np.isneginf(kE))] = 0.
 
 		for z in soil_layers:
 			for l in range(len_pft):
 				for k in range(nc):
-					t_kD[z, l, 0, k] = kE[l, 0, k]/(b_al[z, 0, k] * (zmax[z, k] - zmin[z, k]) * t_hs[0, k] * t_pf[l, 0, k] * t_g[0, k])
+					t_kD[z, l, 0, k] = kE[l, 0, k]/(b_al[z, 0, k] * (zmax[z, k] - zmin[z, k]) * t_g[0, k])
 		t_kD[(np.isnan(t_kD)) | (np.isinf(t_kD)) | (np.isneginf(t_kD))] = 0.
+		t_kD[t_kD > 1.] = 1.
 
 	# Now, calculates the inputs from litter (reminder: unlike the others, it is an absolute value [t] instead of a rate [1/day])
 	km1 = gdal.Open(data_dir + '/input/ORCHIDEE/soilcarbon/soilcarb_input_ma_a_' + str(yr_flux) + '.tif') # data is in gC/m^2/day, according to documentation
@@ -312,8 +280,8 @@ def gen_AB(i, v, yr, mo):
 		klitsb_soils = km6[idx_flux, 0, :]
 		klitsb_soils[klitsb_soils == km6_na] = np.nan
 
-		k_lit_soi['littera'][p] = (klitma_soila + klitsa_soila + klitmb_soila + klitsb_soila) * t_hs # in g/(m2.day)
-		k_lit_soi['litters'][p] = (klitsa_soils + klitsb_soils) * t_hs # in g/(m2.day)
+		k_lit_soi['littera'][p] = (klitma_soila + klitsa_soila + klitmb_soila + klitsb_soila) # in g/(m2.day)
+		k_lit_soi['litters'][p] = (klitsa_soils + klitsb_soils) # in g/(m2.day)
 
 #		### ... and vertically discretizes them proportionally to the observed SOC
 		for k in ['littera', 'litters']:
@@ -375,12 +343,15 @@ def gen_AB(i, v, yr, mo):
  
 		s_a = stock0_a[idx_stock, 0, :]
 		s_a[s_a == stock0_a_na] = np.nan
+		s_a[s_a < 1e-2] = 0.
 
 		s_s = stock0_s[idx_stock, 0, :]
 		s_s[s_s == stock0_s_na] = np.nan
+		s_s[s_s < 1e-2] = 0.
 
 		s_p = stock0_p[idx_stock, 0, :]
 		s_p[s_p == stock0_p_na] = np.nan
+		s_p[s_p < 1e-2] = 0.
 
 		flux_a = fl_a[idx_flux, 0, :]
 		flux_a[flux_a == fl_a_na] = np.nan
@@ -391,7 +362,7 @@ def gen_AB(i, v, yr, mo):
 		flux_p = fl_p[idx_flux, 0, :]
 		flux_p[flux_p == fl_p_na] = np.nan
 
-		ksoila_s_h[p] = FRAC_CARB_AS * flux_a/s_a ## This is actually ksoila_s_h = (FRAC_CARB_AS * flux * t_g * t_hs * (vertical_discretization) * 1e-6)/(s * t_g * t_hs * (vertical_discretization) * 1e-6)
+		ksoila_s_h[p] = FRAC_CARB_AS * flux_a/s_a ## This is actually ksoila_s_h = (FRAC_CARB_AS * flux * t_g * (vertical_discretization) * 1e-6)/(s * t_g * (vertical_discretization) * 1e-6)
 		ksoila_s_h[p][np.isnan(ksoila_s_h[p]) | np.isinf(ksoila_s_h[p]) | np.isneginf(ksoila_s_h[p])] = 0.
 		ksoila_s_h[p][ksoila_s_h[p] > 1.] = 1.
 
@@ -451,7 +422,7 @@ def gen_AB(i, v, yr, mo):
 			if z < (len_soi - 1): ## For all layers except the last, we have vertical flow from [z+1] to [z]
 				A_etdIn_target.append(idx + 0)
 				A_etdIn_source.append(idx_zp1 + 0)
-				A_etdIn_values.append(-t_kD[z+1, t_j1, 0, k])
+				A_etdIn_values.append(- t_kD[z+1, t_j1, 0, k])
 
 			## Slow pool (+1)
 			A_carbon_target.append(idx + 1)
@@ -575,9 +546,9 @@ def gen_mats(v, yr, mo):
 def sq_fun(v):
 	for yr in years:
 		for mo in months:
-			if (yr != 2018 or mo != 11): ok =  gen_mats(v, yr, mo)
+			ok =  gen_mats(v, yr, mo)
 
 # Finally, we evaluate the function
-v = [2.97491262, 2.55649123, 2.52046258, 2.86138299, 1.86101897, 3.22409303, 4.26845489, 1.25774512, 7.36785917, 4.43445958, 4.3076853, 6.94343175, 1.3667537, 1.99010179, 2.22882103, 7.653916, 5.12329096, 4.16539457, 8.70465835, 9.09948618, -2.52965945] # Taken from output_2_1st_order
+v = [4.557645357127455, -2.512184070618636, -7.099665937772622, 5.005065316309821, -0.45921697318257326, 3, 2]
 sq_fun(v)
 
